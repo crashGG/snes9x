@@ -13,8 +13,6 @@
 #include <QThread>
 #include <QStyleHints>
 #include <thread>
-#include <chrono>
-using namespace std::chrono_literals;
 
 #undef SOUND_BUFFER_WINDOW
 
@@ -65,7 +63,11 @@ void EmuApplication::restartAudio()
 }
 
 #ifdef SOUND_BUFFER_WINDOW
+
 #include <QProgressDialog>
+#include <chrono>
+using namespace std::chrono_literals;
+
 static void trackBufferLevel(int percent, QWidget *parent)
 {
     static uint64_t total = 0;
@@ -139,13 +141,6 @@ void EmuApplication::startGame()
         if (window->canvas)
         {
             window->output((uint8_t *)data, width, height, QImage::Format_RGB16, stride_bytes, frame_rate);
-            // QMetaObject::invokeMethod(window.get(), "output", Qt::ConnectionType::DirectConnection,
-            //     Q_ARG(uint8_t *, (uint8_t *)data),
-            //     Q_ARG(int, width),
-            //     Q_ARG(int, height),
-            //     Q_ARG(QImage::Format, QImage::Format_RGB16),
-            //     Q_ARG(int, stride_bytes),
-            //     Q_ARG(double, frame_rate));
         }
     };
 
@@ -248,6 +243,7 @@ void EmuApplication::startThread()
 bool EmuApplication::openFile(std::string filename)
 {
     window->gameChanging();
+    updateSettings();
     suspendThread();
     auto result = core->openFile(filename);
     unsuspendThread();
@@ -339,22 +335,21 @@ void EmuApplication::handleBinding(std::string name, bool pressed)
                 window->pauseContinue();
             }
 
-            else if (name == "IncreaseSlot")
+            else if (name == "IncreaseSlot" || name == "DecreaseSlot")
             {
-                save_slot++;
+                if (name == "IncreaseSlot")
+                    save_slot++;
+                else
+                    save_slot--;
+
                 if (save_slot > 999)
                     save_slot = 0;
-                emu_thread->runOnThread([&] {
-                    core->setMessage("Current slot: " + std::to_string(save_slot));
-                });
-            }
-            else if (name == "DecreaseSlot")
-            {
-                save_slot--;
                 if (save_slot < 0)
                     save_slot = 999;
-                emu_thread->runOnThread([&] {
-                    core->setMessage("Current slot: " + std::to_string(save_slot));
+
+                emu_thread->runOnThread([&, slot = this->save_slot] {
+                    std::string status = core->slotUsed(slot) ? " [used]" : " [empty]";
+                    core->setMessage("Current slot: " + std::to_string(save_slot) + status);
                 });
             }
             else if (name == "SaveState")
@@ -364,6 +359,21 @@ void EmuApplication::handleBinding(std::string name, bool pressed)
             else if (name == "LoadState")
             {
                 loadState(save_slot);
+            }
+            else if (name == "SwapControllers1and2")
+            {
+                int num_bindings = EmuConfig::num_controller_bindings * EmuConfig::allowed_bindings;
+                EmuBinding temp[num_bindings];
+                memcpy(temp, config->binding.controller[0].buttons, sizeof(temp));
+                memcpy(config->binding.controller[0].buttons, config->binding.controller[1].buttons, sizeof(temp));
+                memcpy(config->binding.controller[1].buttons, temp, sizeof(temp));
+                updateBindings();
+            }
+            else if (name == "GrabMouse")
+            {
+                if (config->port_configuration == EmuConfig::eMousePlusController ||
+                    config->port_configuration == EmuConfig::eSuperScopePlusController)
+                    window->toggleMouseGrab();
             }
         }
     }
@@ -461,6 +471,20 @@ void EmuApplication::pollJoysticks()
     }
 }
 
+void EmuApplication::reportPointer(int x, int y)
+{
+    emu_thread->runOnThread([&, x, y] {
+        core->reportPointer(x, y);
+    });
+}
+
+void EmuApplication::reportMouseButton(int button, bool pressed)
+{
+    emu_thread->runOnThread([&, button, pressed] {
+        core->reportMouseButton(button, pressed);
+    });
+}
+
 void EmuApplication::startInputTimer()
 {
     poll_input_timer = std::make_unique<QTimer>();
@@ -543,14 +567,14 @@ void EmuApplication::disableAllCheats()
 
 void EmuApplication::enableCheat(int index)
 {
-    emu_thread->runOnThread([&] {
+    emu_thread->runOnThread([&, index] {
         core->enableCheat(index);
     });
 }
 
 void EmuApplication::disableCheat(int index)
 {
-    emu_thread->runOnThread([&] {
+    emu_thread->runOnThread([&, index] {
         core->disableCheat(index);
     });
 }
@@ -565,7 +589,7 @@ bool EmuApplication::addCheat(std::string description, std::string code)
 
 void EmuApplication::deleteCheat(int index)
 {
-    emu_thread->runOnThread([&] {
+    emu_thread->runOnThread([&, index] {
         core->deleteCheat(index);
     });
 }
@@ -611,16 +635,16 @@ QString EmuApplication::iconPrefix()
     const char *whiteicons = ":/icons/whiteicons/";
     const char *blackicons = ":/icons/blackicons/";
 
-    if (QGuiApplication::styleHints()->colorScheme() == Qt::ColorScheme::Dark)
-        return whiteicons;
-    if (QGuiApplication::styleHints()->colorScheme() == Qt::ColorScheme::Light)
-        return blackicons;
-
     if (QGuiApplication::palette().color(QPalette::WindowText).lightness() >
         QGuiApplication::palette().color(QPalette::Window).lightness())
         return whiteicons;
 
     return blackicons;
+}
+
+std::string EmuApplication::getContentFolder()
+{
+    return core->getContentFolder();
 }
 
 void EmuThread::runOnThread(std::function<void()> func, bool blocking)

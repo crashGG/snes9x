@@ -8,7 +8,7 @@
 #define __WAYLAND_EGL_CONTEXT_H
 
 #include "opengl_context.hpp"
-#include "wayland_surface.hpp"
+#include "common/video/wayland/wayland_surface.hpp"
 
 #include "glad/egl.h"
 #include <memory>
@@ -26,6 +26,8 @@ class WaylandEGLContext : public OpenGLContext
     void swap_buffers();
     void swap_interval(int frames);
     void make_current();
+    void shrink();
+    void regrow();
     bool ready();
 
     EGLDisplay egl_display;

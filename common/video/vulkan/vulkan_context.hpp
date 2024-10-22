@@ -7,13 +7,11 @@
 #undef WINVER
 #define WINVER 0x599
 #endif
-#include <cstdio>
 #include <cstdint>
-#include "vulkan/vulkan.hpp"
-#include "../external/VulkanMemoryAllocator-Hpp/include/vk_mem_alloc.hpp"
+#include "vulkan_hpp_wrapper.hpp"
+#include "external/VulkanMemoryAllocator-Hpp/include/vk_mem_alloc.hpp"
 #include "vulkan_swapchain.hpp"
 #include <memory>
-#include <optional>
 
 namespace Vulkan
 {
@@ -24,22 +22,28 @@ class Context
     Context();
     ~Context();
 #ifdef VK_USE_PLATFORM_XLIB_KHR
-    bool init_Xlib(Display *dpy, Window xid, int preferred_device = -1);
+    bool init_Xlib();
+    bool create_Xlib_surface(Display *dpy, Window xid);
 #endif
 #ifdef VK_USE_PLATFORM_WAYLAND_KHR
-    bool init_wayland(wl_display *dpy, wl_surface *parent, int width, int height, int preferred_device = -1);
+    bool init_wayland();
+    bool create_wayland_surface(wl_display *dpy, wl_surface *parent);
 #endif
 #ifdef VK_USE_PLATFORM_WIN32_KHR
-    bool init_win32(HINSTANCE hinstance, HWND hwnd, int preferred_device = -1);
+    bool init_win32();
+    bool create_win32_surface(HINSTANCE hinstance, HWND hwnd);
 #endif
-    bool init(int preferred_device = -1);
-    bool create_swapchain(int width = -1, int height = -1);
-    bool recreate_swapchain(int width = -1, int height = -1);
+    bool init();
+    bool create_swapchain();
+    bool recreate_swapchain();
+    bool destroy_surface();
     void wait_idle();
     vk::CommandBuffer begin_cmd_buffer();
     void end_cmd_buffer();
     void hard_barrier(vk::CommandBuffer cmd);
     static std::vector<std::string> get_device_list();
+    void set_preferred_device(int device) { preferred_device = device; };
+    void unset_preferred_device() { preferred_device = -1; };
 
     vma::Allocator allocator;
     vk::Device device;
@@ -55,9 +59,10 @@ class Context
 
   private:
     bool init_vma();
-    bool init_device(int preferred_device = 0);
+    bool init_device();
     bool init_command_pool();
     bool init_descriptor_pool();
+    int preferred_device;
 
 #ifdef VK_USE_PLATFORM_XLIB_KHR
     Display *xlib_display;

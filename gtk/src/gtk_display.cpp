@@ -789,7 +789,7 @@ void S9xQueryDrivers()
 
     gui_config->allow_xv = false;
 #if defined(USE_XV) && defined(GDK_WINDOWING_X11)
-    if (GDK_IS_X11_DISPLAY(gdk_display))
+    if (is_x11())
         gui_config->allow_xv = S9xXVDisplayDriver::query_availability();
 #endif
 
@@ -797,7 +797,7 @@ void S9xQueryDrivers()
 
     gui_config->allow_xrandr = false;
 #ifdef GDK_WINDOWING_X11
-    if (GDK_IS_X11_DISPLAY(gdk_display))
+    if (is_x11())
     {
         Display *dpy = gdk_x11_display_get_xdisplay(gdk_display);
         Window xid = gdk_x11_window_get_xid(top_level->window->get_window()->gobj());
@@ -912,7 +912,7 @@ static void S9xInitDriver()
 {
     // Only OpenGL is supported on Wayland
 #ifdef GDK_WINDOWING_WAYLAND
-    if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
+    if (is_wayland())
     {
         if (gui_config->display_driver != "vulkan")
             gui_config->display_driver = "opengl";

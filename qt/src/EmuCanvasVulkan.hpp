@@ -3,11 +3,11 @@
 
 #include "EmuCanvas.hpp"
 #include "ShaderParametersDialog.hpp"
-#include "../../vulkan/vulkan_simple_output.hpp"
-#include "../../vulkan/vulkan_shader_chain.hpp"
+#include "common/video/vulkan/vulkan_simple_output.hpp"
+#include "common/video/vulkan/vulkan_shader_chain.hpp"
 
 #ifndef _WIN32
-#include "common/video/wayland_surface.hpp"
+#include "common/video/wayland/wayland_surface.hpp"
 #endif
 
 class EmuCanvasVulkan : public EmuCanvas
@@ -31,7 +31,6 @@ class EmuCanvasVulkan : public EmuCanvas
 
     bool initImGui();
     void recreateUIAssets() override;
-    vk::UniqueRenderPass imgui_render_pass;
     vk::UniqueDescriptorPool imgui_descriptor_pool;
 
     std::unique_ptr<Vulkan::Context> context;

@@ -1,17 +1,17 @@
 #include "vulkan_swapchain.hpp"
-#include <thread>
+#include "vulkan_context.hpp"
 
 namespace Vulkan
 {
 
-Swapchain::Swapchain(vk::Device device_, vk::PhysicalDevice physical_device_, vk::Queue queue_, vk::SurfaceKHR surface_, vk::CommandPool command_pool_)
-    : surface(surface_),
-      command_pool(command_pool_),
-      physical_device(physical_device_),
-      queue(queue_)
+Swapchain::Swapchain(Context &context_)
+    : context(context_),
+      device(context.device),
+      queue(context.queue),
+      physical_device(context.physical_device),
+      command_pool(context.command_pool.get()),
+      surface(context.surface.get())
 {
-    device = device_;
-    create_render_pass();
     end_render_pass_function = nullptr;
 }
 
@@ -19,13 +19,14 @@ Swapchain::~Swapchain()
 {
 }
 
-bool Swapchain::set_vsync(bool new_setting)
+void Swapchain::set_vsync(bool new_setting)
 {
-    if (new_setting == vsync)
-        return false;
-
-    vsync = new_setting;
-    return true;
+    if (vsync != new_setting)
+    {
+        vsync = new_setting;
+        if (swapchain_object)
+            recreate();
+    }
 }
 
 void Swapchain::on_render_pass_end(std::function<void ()> function)
@@ -75,18 +76,44 @@ void Swapchain::create_render_pass()
         .setDependencies(subpass_dependency)
         .setAttachments(attachment_description);
 
-    render_pass = device.createRenderPassUnique(render_pass_create_info);
+    render_pass = device.createRenderPassUnique(render_pass_create_info).value;
 }
 
-bool Swapchain::recreate(int new_width, int new_height)
+bool Swapchain::recreate()
 {
-    device.waitIdle();
-    return create(num_swapchain_images, new_width, new_height);
+    if (swapchain_object)
+    {
+        device.waitIdle();
+    }
+
+    return create();
 }
 
 vk::Image Swapchain::get_image()
 {
-    return imageviewfbs[current_swapchain_image].image;
+    return image_data[current_swapchain_image].image;
+}
+
+template<typename T>
+static bool vector_find(std::vector<T> haystack, T&& needle)
+{
+    for (auto &elem : haystack)
+        if (elem == needle)
+            return true;
+    return false;
+}
+
+vk::PresentModeKHR Swapchain::get_present_mode() {
+    auto present_mode = vk::PresentModeKHR::eFifo;
+
+    if (!vsync) {
+        if (supports_mailbox)
+            present_mode = vk::PresentModeKHR::eMailbox;
+        if (supports_immediate)
+            present_mode = vk::PresentModeKHR::eImmediate;
+    }
+
+    return present_mode;
 }
 
 bool Swapchain::check_and_resize(int width, int height)
@@ -95,7 +122,7 @@ bool Swapchain::check_and_resize(int width, int height)
 
     if (width == -1 && height == -1)
     {
-        surface_capabilities = physical_device.getSurfaceCapabilitiesKHR(surface);
+        surface_capabilities = physical_device.getSurfaceCapabilitiesKHR(surface).value;
         width = surface_capabilities.currentExtent.width;
         height = surface_capabilities.currentExtent.height;
     }
@@ -105,28 +132,41 @@ bool Swapchain::check_and_resize(int width, int height)
 
     if (extents.width != (uint32_t)width || extents.height != (uint32_t)height)
     {
-        recreate(width, height);
+        set_desired_size(width, height);
+        recreate();
         return true;
     }
 
     return false;
 }
 
-bool Swapchain::create(unsigned int desired_num_swapchain_images, int new_width, int new_height)
+bool Swapchain::uncreate()
 {
     frames.clear();
-    imageviewfbs.clear();
+    image_data.clear();
+    swapchain_object.reset();
 
-    auto surface_capabilities = physical_device.getSurfaceCapabilitiesKHR(surface);
+    return true;
+}
 
-    if (surface_capabilities.minImageCount > desired_num_swapchain_images)
+bool Swapchain::create()
+{
+    if (!render_pass)
+        create_render_pass();
+
+    frames.clear();
+    image_data.clear();
+
+    auto surface_capabilities = physical_device.getSurfaceCapabilitiesKHR(surface).value;
+
+    if (desired_latency == - 1 || (int)surface_capabilities.minImageCount > desired_latency)
         num_swapchain_images = surface_capabilities.minImageCount;
     else
-        num_swapchain_images = desired_num_swapchain_images;
+        num_swapchain_images = desired_latency;
 
     // If extents aren't reported (Wayland), we have to rely on Wayland to report
     // the size, so keep current extent.
-    if (surface_capabilities.currentExtent.width != -1)
+    if (surface_capabilities.currentExtent.width != UINT32_MAX)
         extents = surface_capabilities.currentExtent;
 
     uint32_t graphics_queue_index = 0;
@@ -140,11 +180,11 @@ bool Swapchain::create(unsigned int desired_num_swapchain_images, int new_width,
         }
     }
 
-    if (new_width > 0 && new_height > 0)
+    if (desired_width > 0 && desired_height > 0)
     {
         // No buffer is allocated for surface yet
-        extents.width = new_width;
-        extents.height = new_height;
+        extents.width = desired_width;
+        extents.height = desired_height;
     }
     else if (extents.width < 1 || extents.height < 1)
     {
@@ -163,13 +203,6 @@ bool Swapchain::create(unsigned int desired_num_swapchain_images, int new_width,
     if (extents.height < surface_capabilities.minImageExtent.height)
         extents.height = surface_capabilities.minImageExtent.height;
 
-    auto present_modes = physical_device.getSurfacePresentModesKHR(surface);
-    auto tearing_present_mode = vk::PresentModeKHR::eFifo;
-    if (std::find(present_modes.begin(), present_modes.end(), vk::PresentModeKHR::eImmediate) != present_modes.end())
-        tearing_present_mode = vk::PresentModeKHR::eImmediate;
-    if (std::find(present_modes.begin(), present_modes.end(), vk::PresentModeKHR::eMailbox) != present_modes.end())
-        tearing_present_mode = vk::PresentModeKHR::eMailbox;
-
     auto swapchain_create_info = vk::SwapchainCreateInfoKHR{}
         .setMinImageCount(num_swapchain_images)
         .setImageFormat(vk::Format::eB8G8R8A8Unorm)
@@ -179,33 +212,37 @@ bool Swapchain::create(unsigned int desired_num_swapchain_images, int new_width,
         .setImageUsage(vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eTransferSrc)
         .setCompositeAlpha(vk::CompositeAlphaFlagBitsKHR::eOpaque)
         .setClipped(true)
-        .setPresentMode(vsync ? vk::PresentModeKHR::eFifo : tearing_present_mode)
+        .setPresentMode(get_present_mode())
         .setSurface(surface)
         .setPreTransform(vk::SurfaceTransformFlagBitsKHR::eIdentity)
         .setImageArrayLayers(1)
         .setQueueFamilyIndices(graphics_queue_index);
 
-    if (swapchain_object)
-        swapchain_create_info.setOldSwapchain(swapchain_object.get());
-
-    try {
-        swapchain_object = device.createSwapchainKHRUnique(swapchain_create_info);
-    } catch (std::exception &e) {
+    swapchain_object.reset();
+    auto resval = device.createSwapchainKHRUnique(swapchain_create_info);
+    if (resval.result != vk::Result::eSuccess && resval.result != vk::Result::eSuboptimalKHR)
+    {
         swapchain_object.reset();
-    }
-
-    if (!swapchain_object)
         return false;
+    }
+    swapchain_object = std::move(resval.value);
 
-    auto swapchain_images = device.getSwapchainImagesKHR(swapchain_object.get());
-    vk::CommandBufferAllocateInfo command_buffer_allocate_info(command_pool, vk::CommandBufferLevel::ePrimary, swapchain_images.size());
-    auto command_buffers = device.allocateCommandBuffersUnique(command_buffer_allocate_info);
+    create_resources();
 
-    if (imageviewfbs.size() > num_swapchain_images)
-        num_swapchain_images = imageviewfbs.size();
+    return true;
+}
+
+bool Swapchain::create_resources()
+{
+    auto swapchain_images = device.getSwapchainImagesKHR(swapchain_object.get()).value;
+    if (swapchain_images.size() > num_swapchain_images)
+        num_swapchain_images = swapchain_images.size();
+
+    vk::CommandBufferAllocateInfo command_buffer_allocate_info(command_pool, vk::CommandBufferLevel::ePrimary, num_swapchain_images);
+    auto command_buffers = device.allocateCommandBuffersUnique(command_buffer_allocate_info).value;
 
     frames.resize(num_swapchain_images);
-    imageviewfbs.resize(num_swapchain_images);
+    image_data.resize(num_swapchain_images);
 
     vk::FenceCreateInfo fence_create_info(vk::FenceCreateFlagBits::eSignaled);
 
@@ -214,16 +251,15 @@ bool Swapchain::create(unsigned int desired_num_swapchain_images, int new_width,
         // Create frame queue resources
         auto &frame = frames[i];
         frame.command_buffer = std::move(command_buffers[i]);
-        frame.fence = device.createFenceUnique(fence_create_info);
-        frame.acquire = device.createSemaphoreUnique({});
-        frame.complete = device.createSemaphoreUnique({});
+        frame.fence = device.createFenceUnique(fence_create_info).value;
+        frame.acquire = device.createSemaphoreUnique({}).value;
+        frame.complete = device.createSemaphoreUnique({}).value;
     }
-    current_frame = 0;
 
     for (unsigned int i = 0; i < num_swapchain_images; i++)
     {
         // Create resources associated with swapchain images
-        auto &image = imageviewfbs[i];
+        auto &image = image_data[i];
         image.image = swapchain_images[i];
         auto image_view_create_info = vk::ImageViewCreateInfo{}
             .setImage(swapchain_images[i])
@@ -231,7 +267,7 @@ bool Swapchain::create(unsigned int desired_num_swapchain_images, int new_width,
             .setFormat(vk::Format::eB8G8R8A8Unorm)
             .setComponents(vk::ComponentMapping())
             .setSubresourceRange(vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1));
-        image.image_view = device.createImageViewUnique(image_view_create_info);
+        image.image_view = device.createImageViewUnique(image_view_create_info).value;
 
         auto framebuffer_create_info = vk::FramebufferCreateInfo{}
             .setAttachments(image.image_view.get())
@@ -239,12 +275,11 @@ bool Swapchain::create(unsigned int desired_num_swapchain_images, int new_width,
             .setHeight(extents.height)
             .setLayers(1)
             .setRenderPass(render_pass.get());
-        image.framebuffer = device.createFramebufferUnique(framebuffer_create_info);
+        image.framebuffer = device.createFramebufferUnique(framebuffer_create_info).value;
     }
 
-    device.waitIdle();
-
     current_swapchain_image = 0;
+    current_frame = 0;
 
     return true;
 }
@@ -259,7 +294,7 @@ bool Swapchain::begin_frame()
 
     auto &frame = frames[current_frame];
 
-    auto result = device.waitForFences(frame.fence.get(), true, 33333333);
+    auto result = device.waitForFences({ frame.fence.get() }, true, 33333333);
     if (result != vk::Result::eSuccess)
     {
         printf("Timed out waiting for fence.\n");
@@ -267,11 +302,7 @@ bool Swapchain::begin_frame()
     }
 
     vk::ResultValue<uint32_t> result_value(vk::Result::eSuccess, 0);
-    try {
-        result_value = device.acquireNextImageKHR(swapchain_object.get(), UINT64_MAX, frame.acquire.get());
-    } catch (vk::OutOfDateKHRError &e) {
-        result_value.result = vk::Result::eErrorOutOfDateKHR;
-    }
+    result_value = device.acquireNextImageKHR(swapchain_object.get(), 33333333, frame.acquire.get());
 
     if (result_value.result == vk::Result::eErrorOutOfDateKHR ||
         result_value.result == vk::Result::eSuboptimalKHR)
@@ -324,14 +355,11 @@ bool Swapchain::swap()
         .setSwapchains(swapchain_object.get())
         .setImageIndices(current_swapchain_image);
 
-    vk::Result result = vk::Result::eSuccess;
-    try {
-        result = queue.presentKHR(present_info);
-    } catch (vk::OutOfDateKHRError &e) {
+    vk::Result result = queue.presentKHR(present_info);
+    if (result == vk::Result::eErrorOutOfDateKHR)
+    {
         // NVIDIA binary drivers will set OutOfDate between acquire and
         // present. Ignore this and fix it on the next swapchain acquire.
-    } catch (std::exception &e) {
-        printf("%s\n", e.what());
     }
 
     current_frame = (current_frame + 1) % num_swapchain_images;
@@ -349,7 +377,7 @@ bool Swapchain::end_frame()
 
 vk::Framebuffer Swapchain::get_framebuffer()
 {
-    return imageviewfbs[current_swapchain_image].framebuffer.get();
+    return image_data[current_swapchain_image].framebuffer.get();
 }
 
 vk::CommandBuffer &Swapchain::get_cmd()
@@ -366,7 +394,7 @@ void Swapchain::begin_render_pass()
 
     auto render_pass_begin_info = vk::RenderPassBeginInfo{}
         .setRenderPass(render_pass.get())
-        .setFramebuffer(imageviewfbs[current_swapchain_image].framebuffer.get())
+        .setFramebuffer(image_data[current_swapchain_image].framebuffer.get())
         .setRenderArea(vk::Rect2D({}, extents))
         .setClearValues(value);
     get_cmd().beginRenderPass(render_pass_begin_info, vk::SubpassContents::eInline);
@@ -381,12 +409,6 @@ void Swapchain::end_render_pass()
     }
 
     get_cmd().endRenderPass();
-}
-
-bool Swapchain::wait_on_frame(int frame_num)
-{
-    auto result = device.waitForFences(frames[frame_num].fence.get(), true, 33000000);
-    return (result == vk::Result::eSuccess);
 }
 
 vk::Extent2D Swapchain::get_extents()

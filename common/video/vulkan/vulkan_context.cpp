@@ -1,10 +1,8 @@
-#include <exception>
 #include <cstring>
-#include <tuple>
 #include <vector>
 #include <string>
+#include <optional>
 #include "vulkan_context.hpp"
-#include "slang_shader.hpp"
 
 namespace Vulkan
 {
@@ -13,24 +11,21 @@ static std::unique_ptr<vk::DynamicLoader> dl;
 
 Context::Context()
 {
+    swapchain = std::make_unique<Swapchain>(*this);
 }
 
 Context::~Context()
 {
     if (!device)
         return;
-    device.waitIdle();
 
-    swapchain = nullptr;
-
+    wait_idle();
+    swapchain.reset();
     command_pool.reset();
     descriptor_pool.reset();
-
     allocator.destroy();
-
     surface.reset();
-    device.waitIdle();
-
+    wait_idle();
     device.destroy();
 }
 
@@ -59,21 +54,24 @@ static vk::UniqueInstance create_instance_preamble(const char *wsi_extension)
     if (!dl || !dl->success())
         return {};
 
-    std::vector<const char *> extensions = { wsi_extension, VK_KHR_SURFACE_EXTENSION_NAME };
-    vk::ApplicationInfo application_info({}, {}, {}, {}, VK_API_VERSION_1_0);
+    std::vector<const char *> extensions = {
+        wsi_extension,
+        VK_KHR_SURFACE_EXTENSION_NAME
+    };
+    vk::ApplicationInfo application_info({}, {}, {}, {}, VK_API_VERSION_1_1);
     vk::InstanceCreateInfo instance_create_info({}, &application_info, {}, extensions);
 
-    vk::UniqueInstance instance;
-    try {
-        instance = vk::createInstanceUnique(instance_create_info);
-    } catch (std::exception &e) {
+    auto [result, instance] = vk::createInstanceUnique(instance_create_info);
+
+    if (result != vk::Result::eSuccess)
+    {
         instance.reset();
         return {};
     }
 
     VULKAN_HPP_DEFAULT_DISPATCHER.init(instance.get());
 
-    return instance;
+    return std::move(instance);
 }
 
 std::vector<std::string> Vulkan::Context::get_device_list()
@@ -83,7 +81,7 @@ std::vector<std::string> Vulkan::Context::get_device_list()
     if (!instance)
         return {};
 
-    auto device_list = instance->enumeratePhysicalDevices();
+    auto [result, device_list] = instance->enumeratePhysicalDevices();
     for (auto &d : device_list)
     {
         auto props = d.getProperties();
@@ -97,69 +95,92 @@ std::vector<std::string> Vulkan::Context::get_device_list()
 }
 
 #ifdef VK_USE_PLATFORM_WIN32_KHR
-bool Context::init_win32(HINSTANCE hinstance, HWND hwnd, int preferred_device)
+bool Context::init_win32()
 {
     instance = create_instance_preamble(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
     if (!instance)
         return false;
 
+    return init();
+}
+
+bool Context::create_win32_surface(HINSTANCE hinstance, HWND hwnd)
+{
     auto win32_surface_create_info = vk::Win32SurfaceCreateInfoKHR{}
         .setHinstance(hinstance)
         .setHwnd(hwnd);
-    surface = instance->createWin32SurfaceKHRUnique(win32_surface_create_info);
-    if (!surface)
+    auto retval = instance->createWin32SurfaceKHRUnique(win32_surface_create_info);
+    if (retval.result != vk::Result::eSuccess)
         return false;
-    return init(preferred_device);
+    surface = std::move(retval.value);
+    return true;
 }
 #endif
 
 #ifdef VK_USE_PLATFORM_XLIB_KHR
-bool Context::init_Xlib(Display *dpy, Window xid, int preferred_device)
+bool Context::init_Xlib()
 {
     instance = create_instance_preamble(VK_KHR_XLIB_SURFACE_EXTENSION_NAME);
     if (!instance)
         return false;
 
-    surface = instance->createXlibSurfaceKHRUnique({ {}, dpy, xid });
+    return init();
+}
 
-    if (!surface)
+bool Context::create_Xlib_surface(Display *dpy, Window xid)
+{
+    auto retval = instance->createXlibSurfaceKHRUnique({ {}, dpy, xid });
+    if (retval.result != vk::Result::eSuccess)
         return false;
-    return init(preferred_device);
+    surface = std::move(retval.value);
+
+    return true;
 }
 #endif
 
 #ifdef VK_USE_PLATFORM_WAYLAND_KHR
-bool Context::init_wayland(wl_display *dpy, wl_surface *parent, int initial_width, int initial_height, int preferred_device)
+bool Context::init_wayland()
 {
     instance = create_instance_preamble(VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME);
     if (!instance)
         return false;
 
+    return init();
+}
+
+bool Context::create_wayland_surface(wl_display *dpy, wl_surface *parent)
+{
     auto wayland_surface_create_info = vk::WaylandSurfaceCreateInfoKHR{}
         .setSurface(parent)
         .setDisplay(dpy);
-    surface = instance->createWaylandSurfaceKHRUnique(wayland_surface_create_info);
-    if (!surface)
-        return false;
 
-    init_device(preferred_device);
-    init_vma();
-    init_command_pool();
-    init_descriptor_pool();
-    create_swapchain(initial_width, initial_height);
-    wait_idle();
+    auto [result, new_surface] = instance->createWaylandSurfaceKHRUnique(wayland_surface_create_info);
+    if (result != vk::Result::eSuccess)
+        return false;
+    surface = std::move(new_surface);
+
     return true;
 }
 #endif
 
-bool Context::init(int preferred_device)
+bool Context::destroy_surface()
 {
-    init_device(preferred_device);
+    wait_idle();
+    if (swapchain)
+        swapchain->uncreate();
+
+    surface.reset();
+
+    return true;
+}
+
+bool Context::init()
+{
+    init_device();
     init_vma();
     init_command_pool();
     init_descriptor_pool();
 
-    create_swapchain();
     wait_idle();
     return true;
 }
@@ -173,7 +194,9 @@ bool Context::init_descriptor_pool()
         .setPoolSizes(descriptor_pool_size)
         .setMaxSets(20)
         .setFlags(vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet);
-    descriptor_pool = device.createDescriptorPoolUnique(descriptor_pool_create_info);
+
+    auto retval = device.createDescriptorPoolUnique(descriptor_pool_create_info);
+    descriptor_pool = std::move(retval.value);
 
     return true;
 }
@@ -182,62 +205,91 @@ bool Context::init_command_pool()
 {
     vk::CommandPoolCreateInfo cpci({}, graphics_queue_family_index);
     cpci.setFlags(vk::CommandPoolCreateFlagBits::eResetCommandBuffer);
-    command_pool = device.createCommandPoolUnique(cpci);
+    auto retval = device.createCommandPoolUnique(cpci);
+    command_pool = std::move(retval.value);
 
     return true;
 }
 
-bool Context::init_device(int preferred_device)
+static bool find_extension(std::vector<vk::ExtensionProperties> &props, const char *extension_string)
 {
-    auto device_list = instance->enumeratePhysicalDevices();
+    return std::find_if(props.begin(),
+                        props.end(),
+                        [&](vk::ExtensionProperties &ext) {
+                            return (std::string(ext.extensionName.data()) == extension_string);
+                        }) != props.end();
+};
 
-    auto find_device = [&]() -> vk::PhysicalDevice {
-        for (auto &d : device_list)
-        {
-            auto ep = d.enumerateDeviceExtensionProperties();
-            auto exists = std::find_if(ep.begin(), ep.end(), [](vk::ExtensionProperties &ext) {
-                return (std::string(ext.extensionName.data()) == VK_KHR_SWAPCHAIN_EXTENSION_NAME);
-            });
-
-            if (exists != ep.end())
-                return d;
-        }
-        return device_list[0];
-    };
-
-    if (preferred_device > -1 && (size_t)preferred_device < device_list.size())
-        physical_device = device_list[preferred_device];
-    else
-        physical_device = find_device();
-
-    physical_device.getProperties(&physical_device_props);
-    printf("Vulkan: Using device \"%s\"\n", (const char *)physical_device_props.deviceName);
-
-    graphics_queue_family_index = UINT32_MAX;
-    auto queue_props = physical_device.getQueueFamilyProperties();
+static std::optional<uint32_t> find_graphics_queue(vk::PhysicalDevice &device)
+{
+    auto queue_props = device.getQueueFamilyProperties();
     for (size_t i = 0; i < queue_props.size(); i++)
     {
         if (queue_props[i].queueFlags & vk::QueueFlagBits::eGraphics)
-            graphics_queue_family_index = i;
+        {
+            return i;
+        }
     }
 
-    if (graphics_queue_family_index == UINT32_MAX)
+    return std::nullopt;
+}
+
+static bool check_extensions(std::vector<const char *> &required_extensions, vk::PhysicalDevice &device)
+{
+    auto props = device.enumerateDeviceExtensionProperties().value;
+    for (const auto &extension : required_extensions)
+    {
+        if (!find_extension(props, extension))
+            return false;
+    }
+    return true;
+};
+
+bool Context::init_device()
+{
+    std::vector<const char *> required_extensions = {
+        VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+    };
+
+    auto device_list = instance->enumeratePhysicalDevices().value;
+    bool device_chosen = false;
+    physical_device = vk::PhysicalDevice();
+
+    if (preferred_device > -1 &&
+        (size_t)preferred_device < device_list.size() &&
+        check_extensions(required_extensions, device_list[preferred_device]))
+    {
+        physical_device = device_list[preferred_device];
+        device_chosen = true;
+    }
+
+    if (!device_chosen)
+    {
+        for (auto &device : device_list)
+        {
+            if (check_extensions(required_extensions, device))
+            {
+                physical_device = device;
+                device_chosen = true;
+                break;
+            }
+        }
+    }
+
+    if (!device_chosen)
         return false;
 
-    std::vector<const char *> extension_names = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
-    std::vector<float> priorities { 1.0f };
+    if (auto index = find_graphics_queue(physical_device))
+        graphics_queue_family_index = *index;
+    else
+        return false;
+
+    std::vector<float> priorities = { 1.0f };
     vk::DeviceQueueCreateInfo dqci({}, graphics_queue_family_index, priorities);
-    vk::DeviceCreateInfo dci({}, dqci, {}, extension_names, {});
-    device = physical_device.createDevice(dci);
+    vk::DeviceCreateInfo dci({}, dqci, {}, required_extensions);
+
+    device = physical_device.createDevice(dci).value;
     queue = device.getQueue(graphics_queue_family_index, 0);
-
-    auto surface_formats = physical_device.getSurfaceFormatsKHR(surface.get());
-    auto format = std::find_if(surface_formats.begin(), surface_formats.end(), [](vk::SurfaceFormatKHR &f) {
-        return (f.format == vk::Format::eB8G8R8A8Unorm);
-    });
-
-    if (format == surface_formats.end())
-        return false;
 
     return true;
 }
@@ -253,21 +305,20 @@ bool Context::init_vma()
         .setInstance(instance.get())
         .setPhysicalDevice(physical_device)
         .setPVulkanFunctions(&vulkan_functions);
-    allocator = vma::createAllocator(allocator_create_info);
+    allocator = vma::createAllocator(allocator_create_info).value;
 
     return true;
 }
 
-bool Context::create_swapchain(int width, int height)
+bool Context::create_swapchain()
 {
     wait_idle();
-    swapchain = std::make_unique<Swapchain>(device, physical_device, queue, surface.get(), command_pool.get());
-    return swapchain->create(2, width, height);
+    return swapchain->create();
 }
 
-bool Context::recreate_swapchain(int width, int height)
+bool Context::recreate_swapchain()
 {
-    return swapchain->recreate(width, height);
+    return swapchain->recreate();
 }
 
 void Context::wait_idle()
@@ -279,7 +330,7 @@ void Context::wait_idle()
 vk::CommandBuffer Context::begin_cmd_buffer()
 {
     vk::CommandBufferAllocateInfo command_buffer_allocate_info(command_pool.get(), vk::CommandBufferLevel::ePrimary, 1);
-    auto command_buffer = device.allocateCommandBuffers(command_buffer_allocate_info);
+    auto command_buffer = device.allocateCommandBuffers(command_buffer_allocate_info).value;
     one_time_use_cmd = command_buffer[0];
     one_time_use_cmd.begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
     return one_time_use_cmd;
